@@ -25,6 +25,16 @@ from dataclasses import dataclass, field
 JUDGE_MODEL_ID = "TODO: set pinned Bedrock model id, e.g. anthropic.claude-*-YYYYMMDD-v1:0"
 JUDGE_TEMPERATURE = 0.0
 
+# INTERIM: no AWS/Bedrock dependency wired up yet, so action_alignment and
+# hallucination_check run on a cheap local keyword heuristic instead of a
+# real LLM judge (see _heuristic_action_alignment / _heuristic_hallucination
+# below). This is deliberately approximate -- good enough to unblock local
+# U3 iteration, NOT good enough for U8/U9/U10's real promotion/regression
+# decisions. Flip this to False (and finish the real Bedrock call in
+# _call_judge) before those units start relying on this module for anything
+# that matters. See plan Key Technical Decisions ("LLM-as-judge component...").
+USE_HEURISTIC_JUDGE = True
+
 PASS_THRESHOLD = 0.8  # fraction of the five metrics that must pass
 
 
@@ -61,10 +71,15 @@ class EvalResult:
 # Deterministic field extraction
 # ---------------------------------------------------------------------------
 
-_SOH_RE = re.compile(r"SOH\D{0,15}?([0-9]+\.?[0-9]*)", re.IGNORECASE)
+_SOH_RE = re.compile(r"SOH\D{0,40}?([0-9]+\.?[0-9]*)", re.IGNORECASE)
 _CONFIDENCE_RE = re.compile(r"[Cc]onfidence[:\s]*([0-9]*\.?[0-9]+)")
 _TEMP_RE = re.compile(r"([0-9]*\.?[0-9]+)\s*(?:°C|degrees?\s*C)", re.IGNORECASE)
 _SEVERITY_RE = re.compile(r"\b(Healthy|Warning|Damaged)\b", re.IGNORECASE)
+# Damaged-tier text in this dataset never literally says "Damaged" -- it says
+# "High-severity anomaly confirmed" instead (confirmed empirically, see
+# docs/solutions/debugging-eval-metrics.md). Recognize that phrasing as an
+# alias so severity extraction doesn't silently fail on every Damaged case.
+_HIGH_SEVERITY_ALIAS_RE = re.compile(r"high[\s-]severity", re.IGNORECASE)
 
 
 def _extract_fields(text: str) -> dict:
@@ -74,11 +89,18 @@ def _extract_fields(text: str) -> dict:
         return float(m.group(1)) if m else None
 
     sev_match = _SEVERITY_RE.search(text)
+    if sev_match:
+        severity = sev_match.group(1).capitalize()
+    elif _HIGH_SEVERITY_ALIAS_RE.search(text):
+        severity = "Damaged"
+    else:
+        severity = None
+
     return {
         "soh": _num(_SOH_RE),
         "confidence": _num(_CONFIDENCE_RE),
         "ambient_temp": _num(_TEMP_RE),
-        "severity": sev_match.group(1).capitalize() if sev_match else None,
+        "severity": severity,
     }
 
 
@@ -109,12 +131,17 @@ def check_severity_accuracy(input_context: str, model_output: str) -> MetricScor
 
 def check_threshold_faithfulness(input_context: str, model_output: str) -> MetricScore:
     """Model's cited numbers must match the INPUT case, not the reference answer --
-    faithfulness is about not inventing numbers, not about matching phrasing."""
+    faithfulness is about not inventing numbers, not about matching phrasing.
+
+    Confidence is deliberately excluded from this check: it's a detection-
+    pipeline meta-signal, and neither the dataset's reference answers nor
+    real model generations restate it in prose (confirmed empirically -- see
+    docs/solutions/debugging-eval-metrics.md). Requiring it caused this check
+    to fail on every example regardless of actual SOH/temperature faithfulness."""
     in_fields = _extract_fields(input_context)
     out_fields = _extract_fields(model_output)
     checks = [
         _numbers_match(in_fields["soh"], out_fields["soh"]),
-        _numbers_match(in_fields["confidence"], out_fields["confidence"]),
         _numbers_match(in_fields["ambient_temp"], out_fields["ambient_temp"]),
     ]
     passed = all(checks)
@@ -128,7 +155,9 @@ def check_output_format(model_output: str) -> MetricScore:
     if not model_output or not model_output.strip():
         return MetricScore("output_format", False, "empty output")
 
-    has_severity = _SEVERITY_RE.search(model_output) is not None
+    # Reuse _extract_fields (not a bare _SEVERITY_RE search) so the
+    # "High-severity" == Damaged alias is recognized consistently here too.
+    has_severity = _extract_fields(model_output)["severity"] is not None
     has_action_keyword = bool(
         re.search(r"\b(recommend|action|inspect|replace|monitor|schedule)\b", model_output, re.IGNORECASE)
     )
@@ -167,10 +196,62 @@ def check_hallucination(input_context: str, model_output: str) -> MetricScore:
     return MetricScore("hallucination_check", verdict, rationale)
 
 
+_ID_RE = re.compile(r"\b(?:rack_\d+_\d+_mod\d+|hvac_\d+|plant\d+)\b", re.IGNORECASE)
+
+# Crude, deterministic stand-in for "does the action fit the severity" --
+# matched against the INPUT's severity (ground truth), same as
+# check_severity_accuracy. Keyword lists come from the dataset's own action
+# phrasing (bess_lora_train.jsonl), not invented.
+_ACTION_KEYWORDS_BY_SEVERITY = {
+    "Healthy": ("no action", "continue standard monitoring", "next scheduled inspection"),
+    "Warning": ("schedule inspection", "increase monitoring", "monitor closely", "prepare replacement", "contingency"),
+    "Damaged": ("immediate inspection", "immediate action", "planned replacement", "within 24 hours", "high-priority", "replace"),
+}
+
+
+def _heuristic_action_alignment(input_context: str, model_output: str) -> tuple[bool, str]:
+    """INTERIM heuristic (see USE_HEURISTIC_JUDGE) -- checks the model's
+    recommendation contains at least one keyword expected for the input's
+    actual severity tier. Crude: a real judge would catch tonal mismatches
+    this can't (e.g., a Damaged case that says "replace" but downplays
+    urgency elsewhere). Good enough to unblock local iteration, not to be
+    trusted for real promotion/regression decisions."""
+    severity = _extract_fields(input_context)["severity"]
+    if severity is None or severity not in _ACTION_KEYWORDS_BY_SEVERITY:
+        return False, f"no recognizable severity in input to check action against (severity={severity!r})"
+
+    lowered = model_output.lower()
+    keywords = _ACTION_KEYWORDS_BY_SEVERITY[severity]
+    matched = [kw for kw in keywords if kw in lowered]
+    passed = len(matched) > 0
+    detail = f"heuristic: severity={severity!r} matched_keywords={matched!r}"
+    return passed, detail
+
+
+def _heuristic_hallucination(input_context: str, model_output: str) -> tuple[bool, str]:
+    """INTERIM heuristic (see USE_HEURISTIC_JUDGE) -- flags any node/plant
+    identifier in the model output that doesn't appear in the input. Catches
+    fabricated historical cases/nodes (the concrete failure mode we care
+    about most) but won't catch subtler fabrications a real judge would
+    (invented ambient conditions, invented policy claims, etc.)."""
+    input_ids = {m.group(0).lower() for m in _ID_RE.finditer(input_context)}
+    output_ids = {m.group(0).lower() for m in _ID_RE.finditer(model_output)}
+    fabricated = output_ids - input_ids
+    passed = len(fabricated) == 0
+    detail = f"heuristic: fabricated_ids={sorted(fabricated)!r}" if fabricated else "heuristic: no unrecognized ids in output"
+    return passed, detail
+
+
 def _call_judge(task: str, input_context: str, reference_output: str, model_output: str) -> tuple[bool, str]:
     """Single seam for all LLM-as-judge calls. Swap/mock this in tests instead
     of mocking a bare API client, so test_metrics.py doesn't need to know
     which provider backs the judge."""
+    if USE_HEURISTIC_JUDGE:
+        if task == "action_alignment":
+            return _heuristic_action_alignment(input_context, model_output)
+        if task == "hallucination":
+            return _heuristic_hallucination(input_context, model_output)
+
     raise NotImplementedError(
         f"TODO: call {JUDGE_MODEL_ID} (temperature={JUDGE_TEMPERATURE}) for task={task!r}"
     )

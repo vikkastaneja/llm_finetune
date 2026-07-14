@@ -1,0 +1,11 @@
+.codelens/
+.vscode/
+.memsearch/
+.agents/
+.pytest_cache/
+.cursor/
+unsloth_compiled_cache/
+venv/
+CLAUDE.md
+test.py
+__pycache__/

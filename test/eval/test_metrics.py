@@ -29,6 +29,24 @@ GOOD_MODEL_OUTPUT = (
 )
 
 
+# Real Damaged-tier phrasing from the dataset -- deliberately does NOT
+# contain the literal word "Damaged" (it says "High-severity anomaly
+# confirmed" instead) and uses "SOH degradation at X" (a wider gap than
+# "SOH at X"). GOOD_MODEL_OUTPUT above happens to contain the literal word
+# "Damaged", which is why the bug this fixture regression-tests slipped past
+# the original tests -- see docs/solutions/debugging-eval-metrics.md.
+DAMAGED_STYLE_INPUT = (
+    "Node hvac_3 flagged as Damaged (label=2). SOH: 0.64. Confidence: 0.98. "
+    "Flagged by: consensus (HGT + XGBoost agree). Ambient temp: 35.6°C. Plant: plant1."
+)
+DAMAGED_STYLE_OUTPUT = (
+    "High-severity anomaly confirmed. HVAC unit hvac_3 shows critical SOH degradation "
+    "at 0.64, which is 0.03 below the replacement threshold of 0.67. Elevated ambient "
+    "temperature (35.6°C) is accelerating degradation. Recommended action: immediate "
+    "inspection and planned replacement within 24 hours."
+)
+
+
 def _matching_judge(task: str, **kwargs) -> tuple[bool, str]:
     return True, f"{task}: looks fine"
 
@@ -70,6 +88,43 @@ def test_threshold_faithfulness_fails_on_wrong_number():
     assert "input=" in result.detail
 
 
+def test_severity_extraction_recognizes_high_severity_as_damaged_alias():
+    # Regression test: Damaged-tier text never literally says "Damaged" in
+    # this dataset -- it says "High-severity anomaly confirmed" instead.
+    assert metrics._extract_fields(DAMAGED_STYLE_OUTPUT)["severity"] == "Damaged"
+
+
+def test_severity_accuracy_passes_for_high_severity_phrasing():
+    result = metrics.check_severity_accuracy(DAMAGED_STYLE_INPUT, DAMAGED_STYLE_OUTPUT)
+    assert result.passed is True
+
+
+def test_output_format_recognizes_high_severity_phrasing():
+    result = metrics.check_output_format(DAMAGED_STYLE_OUTPUT)
+    assert result.passed is True
+
+
+def test_soh_extraction_handles_wider_gap_phrasing():
+    # Regression test: "SOH degradation at X" has a wider gap between "SOH"
+    # and the number than "SOH at X" -- the original 15-char window missed it.
+    assert metrics._extract_fields(DAMAGED_STYLE_OUTPUT)["soh"] == 0.64
+
+
+def test_threshold_faithfulness_passes_for_damaged_style_phrasing():
+    result = metrics.check_threshold_faithfulness(DAMAGED_STYLE_INPUT, DAMAGED_STYLE_OUTPUT)
+    assert result.passed is True
+
+
+def test_threshold_faithfulness_ignores_missing_confidence():
+    # Real model generations (and the dataset's own reference answers) never
+    # restate confidence in prose -- this must NOT count as unfaithful as
+    # long as SOH and ambient_temp match. Regression test for the bug found
+    # via docs/solutions/debugging-eval-metrics.md.
+    model_output = "SOH at 0.60. Ambient temperature 46.5°C is elevated. Recommended action: monitor."
+    result = metrics.check_threshold_faithfulness(GOOD_INPUT, model_output)
+    assert result.passed is True
+
+
 def test_output_format_passes_well_formed_answer():
     result = metrics.check_output_format(GOOD_MODEL_OUTPUT)
     assert result.passed is True
@@ -91,6 +146,51 @@ def test_output_format_fails_on_empty_output():
     result = metrics.check_output_format("")
     assert result.passed is False
     assert "empty" in result.detail
+
+
+# ---------------------------------------------------------------------------
+# Interim heuristic judge (USE_HEURISTIC_JUDGE = True) -- real logic, not a
+# stub, so it gets tested directly rather than only via mocking.
+# ---------------------------------------------------------------------------
+
+def test_heuristic_action_alignment_passes_for_matching_severity():
+    passed, detail = metrics._heuristic_action_alignment(GOOD_INPUT, GOOD_MODEL_OUTPUT)
+    assert passed is True
+    assert "Damaged" in detail
+
+
+def test_heuristic_action_alignment_fails_when_action_too_weak_for_severity():
+    # Damaged case, but the recommendation only says to monitor -- no
+    # Damaged-tier keyword present.
+    model_output = "Module rack_3_2_mod1 is classified as Damaged. Continue to monitor closely."
+    passed, _detail = metrics._heuristic_action_alignment(GOOD_INPUT, model_output)
+    assert passed is False
+
+
+def test_heuristic_hallucination_passes_when_no_unrecognized_ids():
+    passed, _detail = metrics._heuristic_hallucination(GOOD_INPUT, GOOD_MODEL_OUTPUT)
+    assert passed is True
+
+
+def test_heuristic_hallucination_flags_fabricated_node_id():
+    model_output = (
+        GOOD_MODEL_OUTPUT
+        + " Similar past case rack_9_9_mod9 was replaced last quarter under identical conditions."
+    )
+    passed, detail = metrics._heuristic_hallucination(GOOD_INPUT, model_output)
+    assert passed is False
+    assert "rack_9_9_mod9" in detail
+
+
+def test_call_judge_dispatches_to_heuristics_by_default():
+    # No monkeypatch -- exercises the real USE_HEURISTIC_JUDGE=True path.
+    verdict, _detail = metrics._call_judge(
+        task="action_alignment",
+        input_context=GOOD_INPUT,
+        reference_output=GOOD_REFERENCE,
+        model_output=GOOD_MODEL_OUTPUT,
+    )
+    assert verdict is True
 
 
 # ---------------------------------------------------------------------------
