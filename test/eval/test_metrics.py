@@ -275,6 +275,34 @@ def test_score_against_aggregates_pass_rate(monkeypatch):
     }
 
 
+def test_score_against_verbose_prints_progress(monkeypatch, capsys):
+    monkeypatch.setattr(metrics, "_call_judge", _matching_judge)
+    held_out_set = [
+        {"input": GOOD_INPUT, "output": GOOD_REFERENCE},
+        {"input": GOOD_INPUT, "output": GOOD_REFERENCE},
+    ]
+
+    def model_output_fn(_input_text: str) -> str:
+        return GOOD_MODEL_OUTPUT
+
+    metrics.score_against(held_out_set, model_output_fn, verbose=True)
+    captured = capsys.readouterr()
+    assert "1/2" in captured.out
+    assert "2/2" in captured.out
+
+
+def test_score_against_silent_by_default(monkeypatch, capsys):
+    monkeypatch.setattr(metrics, "_call_judge", _matching_judge)
+    held_out_set = [{"input": GOOD_INPUT, "output": GOOD_REFERENCE}]
+
+    def model_output_fn(_input_text: str) -> str:
+        return GOOD_MODEL_OUTPUT
+
+    metrics.score_against(held_out_set, model_output_fn)
+    captured = capsys.readouterr()
+    assert captured.out == ""
+
+
 def test_score_against_handles_malformed_outputs_in_batch(monkeypatch):
     monkeypatch.setattr(metrics, "_call_judge", _matching_judge)
     held_out_set = [

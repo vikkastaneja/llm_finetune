@@ -1,0 +1,24 @@
+# Shared configuration for train.py and generate.py -- single source of
+# truth so held-out split settings and severity distribution can't silently
+# drift out of sync between the two scripts. Pass a different file via
+# --config on either script to override.
+
+held_out:
+  size: 250
+  seed: 12  # fixed -- the held-out split must stay identical across every
+            # run, or "the fixed held-out set" (plan R3) stops meaning
+            # anything comparable across runs.
+
+# Matches bess_lora_train.jsonl's real distribution (Warning 40% / Damaged
+# 35% / Healthy 25%) -- confirmed empirically, not guessed. Default severity
+# mix for generate.py.
+severity_distribution:
+  Healthy: 0.65
+  Warning: 0.20
+  Damaged: 0.15
+
+# Default record count and seed for generate.py -- how many synthetic cases
+# to produce when you don't pass -n/--seed explicitly.
+total_records:
+  n: 1000
+  seed: 100

@@ -276,7 +276,7 @@ def score(reference_output: str, model_output: str, input_context: str) -> EvalR
     return EvalResult(scores=scores)
 
 
-def score_against(held_out_set: list[dict], model_output_fn) -> dict:
+def score_against(held_out_set: list[dict], model_output_fn, verbose: bool = False) -> dict:
     """Score a model against a full held-out set. `held_out_set` is a list of
     {"input": ..., "output": ...} rows (same shape as bess_lora_train.jsonl).
     `model_output_fn(input_text) -> str` generates the model's answer for a
@@ -284,11 +284,25 @@ def score_against(held_out_set: list[dict], model_output_fn) -> dict:
 
     Returns an aggregate: overall pass rate plus per-metric pass rates, which
     is what U3's threshold gate and U9/U10's comparisons consume.
-    """
-    results = [
-        score(reference_output=row["output"], model_output=model_output_fn(row["input"]), input_context=row["input"])
-        for row in held_out_set
-    ]
+
+    verbose=True prints progress as each example is scored -- one model
+    generation per example means this loop can take a long time for a large
+    held-out set (e.g. held_out.size in the hundreds), and without progress
+    output that looks like a silent hang rather than normal, slow work."""
+    import time
+
+    n_total = len(held_out_set)
+    results = []
+    start = time.monotonic()
+    for i, row in enumerate(held_out_set, start=1):
+        results.append(
+            score(reference_output=row["output"], model_output=model_output_fn(row["input"]), input_context=row["input"])
+        )
+        if verbose:
+            elapsed = time.monotonic() - start
+            avg = elapsed / i
+            remaining = avg * (n_total - i)
+            print(f"  scored {i}/{n_total} ({elapsed:.0f}s elapsed, ~{remaining:.0f}s remaining)", flush=True)
 
     non_malformed = [r for r in results if not r.is_malformed]
     overall_pass_rate = sum(1 for r in results if r.passes_threshold) / len(results) if results else 0.0

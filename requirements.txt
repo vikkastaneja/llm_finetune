@@ -1,2 +1,4 @@
 unsloth
 pytest
+pyyaml
+pytest-cov

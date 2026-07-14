@@ -6,6 +6,8 @@
 .cursor/
 unsloth_compiled_cache/
 venv/
-CLAUDE.md
 test.py
 __pycache__/
+.coverage
+output/
+*.jsonl

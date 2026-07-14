@@ -14,6 +14,11 @@ Usage:
     python src/local_train/train.py --base_model unsloth/Qwen2.5-3B-Instruct-bnb-4bit \\
         --lora_r 16 --epochs 4 --learning_rate 2e-4 \\
         --data_path bess_lora_train.jsonl --output_dir outputs/run1
+
+Held-out split size/seed come from project_config.yaml by default -- pass
+--config <path> to use a different config file, or --held_out_size/
+--held_out_seed to override just those two values without touching the
+config. See project_config.py.
 """
 
 from __future__ import annotations
@@ -29,18 +34,19 @@ from pathlib import Path
 # path, -m, different cwd) -- avoids requiring PYTHONPATH setup by hand.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import yaml  # TODO: add pyyaml to requirements.txt if not already present
+import yaml
 
+import project_config
 from eval import metrics
 
 INSTRUCTION_KEY = "instruction"
 INPUT_KEY = "input"
 OUTPUT_KEY = "output"
 
-HELD_OUT_SEED = 42  # fixed seed -- the held-out split must stay the same
-                     # across every run so "the fixed held-out set" (R3)
-                     # actually means the same set every time, not a fresh
-                     # random split per invocation.
+# held_out.size / held_out.seed come from project_config.yaml (shared with
+# generate.py's severity_distribution) rather than being hardcoded here --
+# the seed in particular MUST stay fixed across every run, or "the fixed
+# held-out set" (plan R3) stops meaning the same set every time.
 
 
 # ---------------------------------------------------------------------------
@@ -58,7 +64,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--per_device_train_batch_size", type=int, default=4)
     p.add_argument("--gradient_accumulation_steps", type=int, default=4)
     p.add_argument("--data_path", default="bess_lora_train.jsonl")
-    p.add_argument("--held_out_size", type=int, default=30)
+    p.add_argument(
+        "--held_out_size", type=int, default=None,
+        help="Default: held_out.size from --config (project_config.yaml).",
+    )
+    p.add_argument(
+        "--held_out_seed", type=int, default=None,
+        help="Default: held_out.seed from --config (project_config.yaml).",
+    )
+    p.add_argument(
+        "--config", default=None,
+        help="Path to project_config.yaml (default: ./project_config.yaml, or built-in fallback if absent).",
+    )
     p.add_argument("--output_dir", required=True)
     p.add_argument("--run_log_path", default="local_run_log.jsonl")
     p.add_argument("--recipe_path", default="recipe.yaml")
@@ -91,13 +108,21 @@ def load_rows(data_path: str) -> list[dict]:
     return rows
 
 
-def split_train_held_out(rows: list[dict], held_out_size: int) -> tuple[list[dict], list[dict]]:
+def resolve_held_out_settings(args: argparse.Namespace, config: dict) -> tuple[int, int]:
+    """CLI flags win when explicitly passed; otherwise fall back to
+    project_config.yaml's held_out.size/seed."""
+    size = args.held_out_size if args.held_out_size is not None else config["held_out"]["size"]
+    seed = args.held_out_seed if args.held_out_seed is not None else config["held_out"]["seed"]
+    return size, seed
+
+
+def split_train_held_out(rows: list[dict], held_out_size: int, held_out_seed: int) -> tuple[list[dict], list[dict]]:
     """Deterministic split -- same held_out_size and seed always produces the
     same held-out rows, regardless of when/how many times this runs."""
     import random
 
     indices = list(range(len(rows)))
-    random.Random(HELD_OUT_SEED).shuffle(indices)
+    random.Random(held_out_seed).shuffle(indices)
     held_out_idx = set(indices[:held_out_size])
     train_rows = [row for i, row in enumerate(rows) if i not in held_out_idx]
     held_out_rows = [row for i, row in enumerate(rows) if i in held_out_idx]
@@ -298,8 +323,11 @@ def write_promotion_config(promotion_config_path: str, margin: float, n_runs: in
 # ---------------------------------------------------------------------------
 
 def train(args: argparse.Namespace) -> None:
+    config = project_config.load_config(args.config)
+    held_out_size, held_out_seed = resolve_held_out_settings(args, config)
+
     rows = load_rows(args.data_path)
-    train_rows, held_out_rows = split_train_held_out(rows, args.held_out_size)
+    train_rows, held_out_rows = split_train_held_out(rows, held_out_size, held_out_seed)
     instruction = rows[0][INSTRUCTION_KEY]  # constant across the dataset
 
     if args.eval_only:
@@ -316,7 +344,8 @@ def train(args: argparse.Namespace) -> None:
         tokenizer.save_pretrained(args.output_dir)
 
     model_output_fn = make_model_output_fn(model, tokenizer, instruction)
-    eval_summary = metrics.score_against(held_out_rows, model_output_fn)
+    print(f"Scoring {len(held_out_rows)} held-out examples...")
+    eval_summary = metrics.score_against(held_out_rows, model_output_fn, verbose=True)
 
     print(f"Held-out overall pass rate: {eval_summary['overall_pass_rate']:.2%}")
     print(f"Per-metric pass rates: {eval_summary['per_metric_pass_rate']}")
